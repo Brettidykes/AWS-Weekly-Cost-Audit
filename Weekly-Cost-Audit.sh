@@ -1,16 +1,15 @@
-cat > weekly_cost_analysis_with_drilldown.sh << 'SCRIPT_EOF'
 #!/bin/bash
 
-# Enhanced Weekly AWS Cost Analysis - WITH AUTOMATIC SPIKE DRILL-DOWN
-# CloudShell compatible version - Fixed awk syntax
+# Enhanced Weekly AWS Cost Analysis - 8 weeks with Month-over-Month Service Analysis
+# CloudShell compatible version
 
 set -e
 
 # Configuration
-WEEKS_TO_COMPARE=6
+WEEKS_TO_COMPARE=8  # 8 weeks = ~2 months for month-over-month comparison
 ANOMALY_THRESHOLD=25
 COST_THRESHOLD=10
-WEEKLY_SPIKE_THRESHOLD=50
+WEEKLY_SPIKE_THRESHOLD=20  # Lowered from 50% to 20%
 OUTPUT_DIR="./cost_reports"
 DATE=$(date +%Y-%m-%d)
 
@@ -37,6 +36,25 @@ get_week_range() {
     local start_date=$(date -d "monday-$((adjusted_weeks + 1)) weeks" +%Y-%m-%d)
     local end_date=$(date -d "sunday-$adjusted_weeks weeks" +%Y-%m-%d)
     echo "$start_date $end_date"
+}
+
+# Function to check if a week contains the 1st of any month
+week_contains_first() {
+    local start_date=$1
+    local end_date=$2
+    
+    # Check each day in the week
+    current_date="$start_date"
+    while [ "$current_date" != "$(date -d "$end_date + 1 day" +%Y-%m-%d)" ]; do
+        day=$(date -d "$current_date" +%d)
+        if [ "$day" = "01" ]; then
+            echo "$current_date"
+            return 0
+        fi
+        current_date=$(date -d "$current_date + 1 day" +%Y-%m-%d)
+    done
+    echo ""
+    return 1
 }
 
 # Get costs grouped by service
@@ -111,6 +129,20 @@ wow_percent=$(awk "BEGIN {printf \"%.2f\", ($wow_change / $prev_week_total) * 10
 avg_change=$(awk "BEGIN {printf \"%.2f\", $current_total - $avg_previous}")
 avg_percent=$(awk "BEGIN {printf \"%.2f\", ($avg_change / $avg_previous) * 100}")
 
+# Month-over-month comparison (last 4 weeks vs previous 4 weeks)
+recent_month_total=0
+for i in $(seq 0 3); do
+    recent_month_total=$(awk "BEGIN {print $recent_month_total + ${week_totals[$i]}}")
+done
+
+previous_month_total=0
+for i in $(seq 4 7); do
+    previous_month_total=$(awk "BEGIN {print $previous_month_total + ${week_totals[$i]}}")
+done
+
+mom_change=$(awk "BEGIN {printf \"%.2f\", $recent_month_total - $previous_month_total}")
+mom_percent=$(awk "BEGIN {printf \"%.2f\", ($mom_change / $previous_month_total) * 100}")
+
 # Console output
 echo "================================================"
 echo "COST ANALYSIS SUMMARY"
@@ -151,11 +183,27 @@ else
 fi
 
 echo ""
+echo -e "${CYAN}MONTH-OVER-MONTH (Last 4 weeks vs Previous 4 weeks):${NC}"
+printf "${BLUE}Recent Month:${NC}        \$%.2f\n" "$recent_month_total"
+printf "${BLUE}Previous Month:${NC}      \$%.2f\n" "$previous_month_total"
+
+mom_high=$(awk "BEGIN {print ($mom_percent > 10) ? 1 : 0}")
+mom_low=$(awk "BEGIN {print ($mom_percent < -10) ? 1 : 0}")
+
+if [ "$mom_high" -eq 1 ]; then
+    printf "${RED}Month-over-Month:${NC}    +\$%.2f (+%.2f%%) ⚠${NC}\n" "$mom_change" "$mom_percent"
+elif [ "$mom_low" -eq 1 ]; then
+    printf "${GREEN}Month-over-Month:${NC}    \$%.2f (%.2f%%) ✓${NC}\n" "$mom_change" "$mom_percent"
+else
+    printf "${YELLOW}Month-over-Month:${NC}    \$%.2f (%.2f%%)${NC}\n" "$mom_change" "$mom_percent"
+fi
+
+echo ""
 echo "================================================"
 echo ""
 
 # WEEKLY ANOMALY DETECTION WITH AUTOMATIC DRILL-DOWN
-echo -e "${RED}⚠ WEEKLY COST SPIKES/DROPS (with drill-down)${NC}"
+echo -e "${RED}⚠ WEEKLY COST SPIKES/DROPS (threshold: ±${WEEKLY_SPIKE_THRESHOLD}%)${NC}"
 echo "================================================"
 spike_found=0
 
@@ -172,6 +220,9 @@ for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
     if [ "$is_spike" -eq 1 ] || [ "$is_drop" -eq 1 ]; then
         spike_found=1
         
+        # Check if this week contains the 1st of a month
+        first_date=$(week_contains_first "$start" "$end")
+        
         # Display the spike/drop header
         if [ "$is_spike" -eq 1 ]; then
             if [ $i -eq 0 ]; then
@@ -180,6 +231,13 @@ for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
                 echo -e "${RED}🔥 SPIKE - Week -$i${NC} ($start to $end)"
             fi
             printf "   Cost: ${RED}\$%.2f${NC} | Median: \$%.2f | ${RED}+\$%.2f (+%.2f%%)${NC}\n" "$week_total" "$median" "$diff_from_median" "$pct_from_median"
+            
+            # Note if week contains 1st of month
+            if [ -n "$first_date" ]; then
+                month_name=$(date -d "$first_date" +%B)
+                echo -e "   ${YELLOW}📅 NOTE: This week contains $month_name 1st ($first_date)${NC}"
+                echo -e "   ${YELLOW}   Monthly AWS Support charges are typically billed on the 1st${NC}"
+            fi
         else
             if [ $i -eq 0 ]; then
                 echo -e "${GREEN}📉 DROP - Most Recent Week${NC} ($start to $end)"
@@ -187,7 +245,31 @@ for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
                 echo -e "${GREEN}📉 DROP - Week -$i${NC} ($start to $end)"
             fi
             printf "   Cost: ${GREEN}\$%.2f${NC} | Median: \$%.2f | ${GREEN}\$%.2f (%.2f%%)${NC}\n" "$week_total" "$median" "$diff_from_median" "$pct_from_median"
+            
+            if [ -n "$first_date" ]; then
+                month_name=$(date -d "$first_date" +%B)
+                echo -e "   ${YELLOW}📅 NOTE: This week contains $month_name 1st ($first_date)${NC}"
+            fi
         fi
+        
+        echo ""
+        echo -e "   ${CYAN}📅 DAILY BREAKDOWN:${NC}"
+        echo "   ----------------------------------------"
+        
+        # Show daily costs for this week
+        echo "${week_data[$i]}" | jq -r '.ResultsByTime[] | "\(.TimePeriod.Start)|\([.Groups[].Metrics.UnblendedCost.Amount | tonumber] | add)"' | \
+        while IFS='|' read day_date day_total; do
+            day_name=$(date -d "$day_date" +%A)
+            day_formatted=$(date -d "$day_date" +"%b %d")
+            
+            # Check if this is the 1st of the month
+            day_num=$(date -d "$day_date" +%d)
+            if [ "$day_num" = "01" ]; then
+                printf "   ${YELLOW}%-10s %-10s \$%8.2f  ← 1st of month${NC}\n" "$day_name" "$day_formatted" "$day_total"
+            else
+                printf "   %-10s %-10s \$%8.2f\n" "$day_name" "$day_formatted" "$day_total"
+            fi
+        done
         
         echo ""
         echo -e "   ${CYAN}🔍 DRILL-DOWN: What caused this?${NC}"
@@ -204,10 +286,9 @@ for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
             sort_by(-.cost) | 
             .[]' | jq -s '.')
         
-        # Calculate baseline for each service (average of other weeks, excluding this anomalous week)
+        # Calculate baseline for each service
         echo "$anomalous_services" | jq -r '.[] | "\(.service)|\(.cost)"' | while IFS='|' read service spike_week_cost; do
             
-            # Calculate average cost for this service across OTHER weeks (excluding week $i)
             total_baseline=0
             baseline_count=0
             for j in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
@@ -225,10 +306,8 @@ for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
                 avg_baseline=0
             fi
             
-            # Calculate difference
             service_diff=$(awk "BEGIN {printf \"%.2f\", $spike_week_cost - $avg_baseline}")
             
-            # Calculate absolute value for comparison (fixed syntax)
             abs_diff=$(awk "BEGIN {
                 diff = $service_diff
                 if (diff < 0) {
@@ -238,7 +317,6 @@ for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
                 }
             }")
             
-            # Only show services that contributed significantly (>$50 difference)
             significant=$(awk "BEGIN {print ($abs_diff > 50) ? 1 : 0}")
             
             if [ "$significant" -eq 1 ]; then
@@ -253,7 +331,6 @@ for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
                             "$service" "$avg_baseline" "$spike_week_cost" "$service_diff" "$service_pct"
                     fi
                 else
-                    # New service in this week
                     if (( $(awk "BEGIN {print ($spike_week_cost > 50) ? 1 : 0}") )); then
                         printf "   ${YELLOW}⚡ %-40s${NC} \$%8.2f ${YELLOW}(NEW)${NC}\n" "$service" "$spike_week_cost"
                     fi
@@ -270,6 +347,66 @@ if [ "$spike_found" -eq 0 ]; then
     echo ""
 fi
 
+echo "================================================"
+echo ""
+
+# SERVICE-LEVEL MONTH-OVER-MONTH CHANGES
+echo -e "${MAGENTA}📊 SERVICE-LEVEL MONTH-OVER-MONTH ANALYSIS${NC}"
+echo -e "${MAGENTA}(Recent 4 weeks vs Previous 4 weeks)${NC}"
+echo "================================================"
+
+all_services=$(for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do 
+    echo "${week_data[$i]}" | jq -r '[.ResultsByTime[].Groups[].Keys[0]] | .[]'
+done | sort -u)
+
+echo "$all_services" | while read service; do
+    recent_service_total=0
+    for i in $(seq 0 3); do
+        cost=$(echo "${week_data[$i]}" | jq -r --arg svc "$service" '
+            [.ResultsByTime[].Groups[] | select(.Keys[0] == $svc) | .Metrics.UnblendedCost.Amount | tonumber] | add // 0')
+        recent_service_total=$(awk "BEGIN {print $recent_service_total + $cost}")
+    done
+    
+    prev_service_total=0
+    for i in $(seq 4 7); do
+        cost=$(echo "${week_data[$i]}" | jq -r --arg svc "$service" '
+            [.ResultsByTime[].Groups[] | select(.Keys[0] == $svc) | .Metrics.UnblendedCost.Amount | tonumber] | add // 0')
+        prev_service_total=$(awk "BEGIN {print $prev_service_total + $cost}")
+    done
+    
+    service_mom_diff=$(awk "BEGIN {printf \"%.2f\", $recent_service_total - $prev_service_total}")
+    
+    abs_service_diff=$(awk "BEGIN {
+        diff = $service_mom_diff
+        if (diff < 0) {
+            print -diff
+        } else {
+            print diff
+        }
+    }")
+    
+    significant=$(awk "BEGIN {print ($abs_service_diff > 20) ? 1 : 0}")
+    
+    if [ "$significant" -eq 1 ]; then
+        if (( $(awk "BEGIN {print ($prev_service_total > 0) ? 1 : 0}") )); then
+            service_mom_pct=$(awk "BEGIN {printf \"%.1f\", ($service_mom_diff / $prev_service_total) * 100}")
+            
+            if (( $(awk "BEGIN {print ($service_mom_diff > 0) ? 1 : 0}") )); then
+                printf "${RED}↑ %-45s${NC} \$%8.2f → \$%8.2f ${RED}(+\$%.2f, +%.1f%%)${NC}\n" \
+                    "$service" "$prev_service_total" "$recent_service_total" "$service_mom_diff" "$service_mom_pct"
+            else
+                printf "${GREEN}↓ %-45s${NC} \$%8.2f → \$%8.2f ${GREEN}(\$%.2f, %.1f%%)${NC}\n" \
+                    "$service" "$prev_service_total" "$recent_service_total" "$service_mom_diff" "$service_mom_pct"
+            fi
+        else
+            if (( $(awk "BEGIN {print ($recent_service_total > 20) ? 1 : 0}") )); then
+                printf "${YELLOW}⚡ %-45s${NC} \$%8.2f ${YELLOW}(NEW in recent month)${NC}\n" "$service" "$recent_service_total"
+            fi
+        fi
+    fi
+done
+
+echo ""
 echo "================================================"
 echo ""
 
@@ -292,73 +429,6 @@ echo "${week_data[0]}" | jq -r '
 done
 
 echo ""
-echo "================================================"
-echo ""
-
-# SERVICE-LEVEL ANOMALY DETECTION
-echo -e "${MAGENTA}SERVICE-LEVEL ANOMALY DETECTION${NC}"
-echo -e "${MAGENTA}(Comparing most recent complete week vs previous weeks)${NC}"
-echo "================================================"
-
-services=$(echo "${week_data[0]}" | jq -r '[.ResultsByTime[].Groups[].Keys[0]] | unique | .[]')
-
-anomaly_found=0
-
-echo "$services" | while read service; do
-    current_cost=$(echo "${week_data[0]}" | jq -r --arg svc "$service" '
-        [.ResultsByTime[].Groups[] | select(.Keys[0] == $svc) | .Metrics.UnblendedCost.Amount | tonumber] | add // 0')
-    
-    below_threshold=$(awk "BEGIN {print ($current_cost < $COST_THRESHOLD) ? 1 : 0}")
-    if [ "$below_threshold" -eq 1 ]; then
-        continue
-    fi
-    
-    total_prev=0
-    count=0
-    for j in $(seq 1 $((WEEKS_TO_COMPARE - 1))); do
-        prev_cost=$(echo "${week_data[$j]}" | jq -r --arg svc "$service" '
-            [.ResultsByTime[].Groups[] | select(.Keys[0] == $svc) | .Metrics.UnblendedCost.Amount | tonumber] | add // 0')
-        total_prev=$(awk "BEGIN {print $total_prev + $prev_cost}")
-        count=$((count + 1))
-    done
-    
-    avg_cost=$(awk "BEGIN {printf \"%.2f\", $total_prev / $count}")
-    
-    above_zero=$(awk "BEGIN {print ($avg_cost > 0) ? 1 : 0}")
-    if [ "$above_zero" -eq 1 ]; then
-        diff=$(awk "BEGIN {printf \"%.2f\", $current_cost - $avg_cost}")
-        pct=$(awk "BEGIN {printf \"%.2f\", ($diff / $avg_cost) * 100}")
-        
-        increased=$(awk "BEGIN {print ($pct > $ANOMALY_THRESHOLD) ? 1 : 0}")
-        decreased=$(awk "BEGIN {print ($pct < -$ANOMALY_THRESHOLD) ? 1 : 0}")
-        
-        if [ "$increased" -eq 1 ]; then
-            echo -e "${RED}⚠ INCREASED:${NC} $service"
-            printf "   Recent Week: \$%.2f | Average: \$%.2f | Change: ${RED}+\$%.2f (+%.2f%%)${NC}\n" "$current_cost" "$avg_cost" "$diff" "$pct"
-            echo ""
-            anomaly_found=1
-        elif [ "$decreased" -eq 1 ]; then
-            echo -e "${GREEN}✓ DECREASED:${NC} $service"
-            printf "   Recent Week: \$%.2f | Average: \$%.2f | Change: ${GREEN}\$%.2f (%.2f%%)${NC}\n" "$current_cost" "$avg_cost" "$diff" "$pct"
-            echo ""
-            anomaly_found=1
-        fi
-    else
-        above_cost_threshold=$(awk "BEGIN {print ($current_cost > $COST_THRESHOLD) ? 1 : 0}")
-        if [ "$above_cost_threshold" -eq 1 ]; then
-            echo -e "${YELLOW}⚡ NEW SERVICE:${NC} $service"
-            printf "   Recent Week: \$%.2f (No previous history)\n" "$current_cost"
-            echo ""
-            anomaly_found=1
-        fi
-    fi
-done
-
-if [ "$anomaly_found" -eq 0 ]; then
-    echo "No significant service-level anomalies (threshold: ±${ANOMALY_THRESHOLD}%)"
-    echo ""
-fi
-
 echo "================================================"
 echo ""
 
@@ -392,10 +462,67 @@ done
 echo "================================================"
 echo ""
 
-echo "📊 Detailed report: ./cost_reports/detailed_cost_report_$DATE.txt"
-echo "📈 CSV export: ./cost_reports/service_costs_$DATE.csv"
+# ========== REPORT GENERATION SECTION ==========
+
+# Generate full detailed report file
+REPORT_FILE="$OUTPUT_DIR/detailed_cost_report_$DATE.txt"
+
+{
+    echo "================================================"
+    echo "AWS WEEKLY COST ANALYSIS - DETAILED REPORT"
+    echo "Generated: $(date)"
+    echo "================================================"
+    echo ""
+    echo "EXECUTIVE SUMMARY"
+    echo "-----------------"
+    printf "Most Recent Week: \$%.2f (%s to %s)\n" "$current_total" "$most_recent_start" "$most_recent_end"
+    printf "Previous Week: \$%.2f\n" "$prev_week_total"
+    printf "Week-over-Week: \$%.2f (%.2f%%)\n" "$wow_change" "$wow_percent"
+    echo ""
+    printf "Average: \$%.2f | Median: \$%.2f\n" "$avg_previous" "$median"
+    printf "Recent Month: \$%.2f | Previous Month: \$%.2f\n" "$recent_month_total" "$previous_month_total"
+    printf "Month-over-Month: \$%.2f (%.2f%%)\n" "$mom_change" "$mom_percent"
+    echo ""
+    
+    echo "WEEKLY TREND"
+    echo "------------"
+    for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
+        IFS='|' read start end <<< "${week_dates[$i]}"
+        printf "Week -%d (%s to %s): \$%.2f\n" "$i" "$start" "$end" "${week_totals[$i]}"
+    done
+    echo ""
+    
+    echo "TOP 10 SERVICES"
+    echo "---------------"
+    echo "${week_data[0]}" | jq -r '
+        [.ResultsByTime[].Groups[]] | 
+        group_by(.Keys[0]) | 
+        map({service: .[0].Keys[0], cost: (map(.Metrics.UnblendedCost.Amount | tonumber) | add)}) | 
+        sort_by(-.cost) | .[:10] | .[] | "\(.service): $\(.cost)"'
+} > "$REPORT_FILE"
+
+# Generate CSV
+CSV_FILE="$OUTPUT_DIR/service_costs_$DATE.csv"
+{
+    printf "Service"
+    for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do printf ",Week_%d" "$i"; done
+    echo ""
+    
+    all_svcs=$(for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do 
+        echo "${week_data[$i]}" | jq -r '[.ResultsByTime[].Groups[].Keys[0]] | .[]'
+    done | sort -u)
+    
+    echo "$all_svcs" | while read svc; do
+        printf "%s" "$svc"
+        for i in $(seq 0 $((WEEKS_TO_COMPARE - 1))); do
+            cost=$(echo "${week_data[$i]}" | jq -r --arg s "$svc" '
+                [.ResultsByTime[].Groups[] | select(.Keys[0] == $s) | .Metrics.UnblendedCost.Amount | tonumber] | add // 0')
+            printf ",%.2f" "$cost"
+        done
+        echo ""
+    done
+} > "$CSV_FILE"
+
+echo "📊 Detailed report saved: $REPORT_FILE"
+echo "📈 CSV export saved: $CSV_FILE"
 echo ""
-
-SCRIPT_EOF
-
-chmod +x weekly_cost_analysis_with_drilldown.sh
